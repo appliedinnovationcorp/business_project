@@ -6,8 +6,13 @@ from datetime import datetime
 class UserBase(BaseModel):
     email: EmailStr
     full_name: str
+    company: Optional[str] = None
 
 class UserCreate(UserBase):
+    password: str
+
+class UserLogin(BaseModel):
+    email: EmailStr
     password: str
 
 class UserResponse(UserBase):
@@ -21,16 +26,18 @@ class UserResponse(UserBase):
 # Project schemas
 class ProjectBase(BaseModel):
     name: str
-    description: Optional[str] = None
+    description: str
+    industry: Optional[str] = None
+    objectives: Optional[str] = None
 
 class ProjectCreate(ProjectBase):
     pass
 
 class ProjectResponse(ProjectBase):
     id: int
-    user_id: int
+    status: str
     created_at: datetime
-    updated_at: Optional[datetime] = None
+    updated_at: datetime
     
     class Config:
         from_attributes = True
@@ -38,18 +45,18 @@ class ProjectResponse(ProjectBase):
 # Workflow schemas
 class WorkflowBase(BaseModel):
     name: str
-    description: Optional[str] = None
-    config: Optional[Dict[str, Any]] = None
+    description: str
+    nodes: Optional[List[Any]] = []
+    edges: Optional[List[Any]] = []
 
 class WorkflowCreate(WorkflowBase):
     pass
 
 class WorkflowResponse(WorkflowBase):
     id: int
-    project_id: int
     status: str
     created_at: datetime
-    updated_at: Optional[datetime] = None
+    updated_at: datetime
     
     class Config:
         from_attributes = True

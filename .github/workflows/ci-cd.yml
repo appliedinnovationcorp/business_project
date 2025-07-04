@@ -1,0 +1,220 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: ai-platform
+  ECS_SERVICE: ai-platform-service
+  ECS_CLUSTER: ai-platform-cluster
+  ECS_TASK_DEFINITION: ai-platform-task
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18'
+
+    - name: Cache Python dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+
+    - name: Cache Node dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.npm
+        key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+    - name: Install Python dependencies
+      run: |
+        cd ai-platform/backend
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-asyncio httpx
+
+    - name: Install Node dependencies
+      run: |
+        cd ai-platform/frontend
+        npm ci
+
+    - name: Run Python tests
+      env:
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+        SECRET_KEY: test-secret-key
+        AWS_ACCESS_KEY_ID: test
+        AWS_SECRET_ACCESS_KEY: test
+        AWS_DEFAULT_REGION: us-east-1
+      run: |
+        cd ai-platform/backend
+        pytest test_main.py -v
+
+    - name: Run Frontend tests
+      run: |
+        cd ai-platform/frontend
+        npm test -- --coverage --watchAll=false
+
+    - name: Run ESLint
+      run: |
+        cd ai-platform/frontend
+        npm run lint
+
+    - name: Build Frontend
+      run: |
+        cd ai-platform/frontend
+        npm run build
+
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Run Bandit Security Scan
+      run: |
+        pip install bandit
+        cd ai-platform/backend
+        bandit -r . -f json -o bandit-report.json || true
+
+    - name: Run npm audit
+      run: |
+        cd ai-platform/frontend
+        npm audit --audit-level moderate
+
+    - name: Upload security scan results
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-scan-results
+        path: ai-platform/backend/bandit-report.json
+
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build, tag, and push backend image to Amazon ECR
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        cd ai-platform/backend
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:backend-$IMAGE_TAG .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:backend-$IMAGE_TAG
+
+    - name: Build and deploy frontend to S3
+      env:
+        S3_BUCKET: ${{ secrets.S3_BUCKET_NAME }}
+        CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+      run: |
+        cd ai-platform/frontend
+        npm ci
+        npm run build
+        aws s3 sync out/ s3://$S3_BUCKET --delete
+        aws cloudfront create-invalidation --distribution-id $CLOUDFRONT_DISTRIBUTION_ID --paths "/*"
+
+    - name: Deploy to Amazon ECS
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        # Update ECS task definition
+        aws ecs describe-task-definition --task-definition $ECS_TASK_DEFINITION --query taskDefinition > task-definition.json
+        
+        # Update image URI in task definition
+        jq --arg IMAGE_URI "$ECR_REGISTRY/$ECR_REPOSITORY:backend-$IMAGE_TAG" '.containerDefinitions[0].image = $IMAGE_URI' task-definition.json > updated-task-definition.json
+        
+        # Register new task definition
+        aws ecs register-task-definition --cli-input-json file://updated-task-definition.json
+        
+        # Update ECS service
+        aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --task-definition $ECS_TASK_DEFINITION
+
+    - name: Run database migrations
+      env:
+        DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      run: |
+        cd ai-platform/backend
+        pip install alembic psycopg2-binary
+        alembic upgrade head
+
+  performance-test:
+    runs-on: ubuntu-latest
+    needs: build-and-deploy
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install k6
+      run: |
+        sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+        echo "deb https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+        sudo apt-get update
+        sudo apt-get install k6
+
+    - name: Run performance tests
+      env:
+        API_BASE_URL: ${{ secrets.API_BASE_URL }}
+      run: |
+        cd ai-platform/tests
+        k6 run performance-test.js
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: [build-and-deploy, performance-test]
+    if: always()
+    
+    steps:
+    - name: Notify Slack
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+      if: always()
